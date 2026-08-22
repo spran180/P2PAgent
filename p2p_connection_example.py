@@ -1,128 +1,235 @@
-from __future__ import annotations
-
 import argparse
+import json
 import logging
-import random
-import secrets
+import time
+import os
+from litellm import completion
+from dotenv import load_dotenv
+load_dotenv()
 
 import multiaddr
 import trio
 
 from libp2p import new_host
-from libp2p.crypto.secp256k1 import create_new_key_pair
+from libp2p.crypto.rsa import create_new_key_pair
 from libp2p.custom_types import TProtocol
 from libp2p.peer.peerinfo import info_from_p2p_addr
-from libp2p.request_response import JSONCodec, RequestResponse
-from libp2p.utils.address_validation import (
-    find_free_port,
-    get_available_interfaces,
-    get_optimal_binding_address,
+from libp2p.pubsub.gossipsub import GossipSub
+from libp2p.pubsub.pubsub import Pubsub
+from libp2p.stream_muxer.mplex.mplex import MPLEX_PROTOCOL_ID, Mplex
+from libp2p.tools.anyio_service import background_trio_service
+from libp2p.utils.address_validation import find_free_port
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
+logger = logging.getLogger("ai-agent")
 
-logging.basicConfig(level=logging.WARNING)
-logging.getLogger("multiaddr").setLevel(logging.WARNING)
-logging.getLogger("libp2p").setLevel(logging.WARNING)
+TASK_TOPIC = "agent/tasks/v1"
+RESPONSE_TOPIC = "agent/responses/v1"
+GOSSIPSUB_PROTOCOL_ID = TProtocol("/meshsub/1.0.0")
 
-PROTOCOL_ID = TProtocol("/example/request-response/1.0.0")
+key_pair = create_new_key_pair()
 
 
-async def run(
-    port: int,
-    destination: str | None,
-    message: str,
-    seed: int | None = None,
-) -> None:
-    if port <= 0:
+def process_task(task: str, worker_id: str) -> str | None:
+    task_lower = task.lower()
+
+    response = completion(
+        model="openai/aisingapore/Gemma-SEA-LION-v4-27B-IT",
+
+        api_key=os.getenv("SEALION_API_KEY"),
+
+        api_base="https://api.sea-lion.ai/v1",
+
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a helpful AI assistant."
+            },
+            {
+                "role": "user",
+                "content": task
+            }
+        ]
+    )
+
+    return response.choices[0].message.content # type: ignore
+
+
+async def worker_loop(task_sub, pubsub, worker_id, stop_event):
+    logger.info(f"Worker [{worker_id}] listening for tasks...")
+
+    while not stop_event.is_set():
+        try:
+            msg = await task_sub.get()
+            payload = json.loads(msg.data.decode("utf-8"))
+
+            task_id = payload.get("task_id", "unknown")
+            task_text = payload.get("task", "")
+
+            logger.info(f"Received task [{task_id}]: {task_text}")
+
+            result = await trio.to_thread.run_sync(process_task, task_text, worker_id)
+
+            response = json.dumps({
+                "task_id": task_id,
+                "worker_id": worker_id,
+                "result": result,
+                "timestamp": time.time(),
+            }).encode("utf-8")
+
+            await pubsub.publish(RESPONSE_TOPIC, response)
+            logger.info(f"Response sent for task [{task_id}]")
+
+        except Exception:
+            logger.exception("Error in worker loop")
+            await trio.sleep(1)
+
+
+async def dispatcher_response_loop(response_sub, stop_event):
+    while not stop_event.is_set():
+        try:
+            msg = await response_sub.get()
+            payload = json.loads(msg.data.decode("utf-8"))
+
+            task_id = payload.get("task_id", "?")
+            worker_id = payload.get("worker_id", "?")
+            result = payload.get("result", "")
+
+            print(f"\n[Response] task_id={task_id} | worker={worker_id}")
+            print(f"  {result}\n")
+
+        except Exception:
+            logger.exception("Error in response loop")
+            await trio.sleep(1)
+
+
+async def dispatcher_input_loop(pubsub, stop_event):
+    print("\nType a task and press Enter to send to workers.")
+    print('Type "quit" to exit.\n')
+    counter = 0
+
+    while not stop_event.is_set():
+        try:
+            text = await trio.to_thread.run_sync(input, "> ")
+
+            if text.strip().lower() == "quit":
+                stop_event.set()
+                break
+
+            if text.strip():
+                counter += 1
+                task_id = f"task-{counter}"
+                payload = json.dumps({
+                    "task_id": task_id,
+                    "task": text.strip(),
+                }).encode("utf-8")
+
+                await pubsub.publish(TASK_TOPIC, payload)
+                logger.info(f"Dispatched [{task_id}]: {text.strip()}")
+
+        except Exception:
+            logger.exception("Error in input loop")
+            await trio.sleep(1)
+
+
+async def run(destination, is_worker, port):
+    from libp2p.utils.address_validation import (
+        get_available_interfaces,
+        get_optimal_binding_address,
+    )
+
+    if not port:
         port = find_free_port()
-    listen_addr = get_available_interfaces(port)
 
-    if seed is not None:
-        random.seed(seed)
-        secret_number = random.getrandbits(32 * 8)
-        secret = secret_number.to_bytes(length=32, byteorder="big")
-    else:
-        secret = secrets.token_bytes(32)
+    listen_addrs = get_available_interfaces(port)
 
-    host = new_host(key_pair=create_new_key_pair(secret))
-    rr = RequestResponse(host)
-    codec = JSONCodec()
+    host = new_host(
+        key_pair=key_pair,
+        muxer_opt={MPLEX_PROTOCOL_ID: Mplex},
+    )
 
-    async def handler(request: dict[str, str], context) -> dict[str, str]:
-        return {
-            "message": request["message"],
-            "echo": request["message"].upper(),
-            "peer": str(context.peer_id),
-        }
+    gossipsub = GossipSub(
+        protocols=[GOSSIPSUB_PROTOCOL_ID],
+        degree=3,
+        degree_low=2,
+        degree_high=4,
+        direct_peers=None,
+        time_to_live=60,
+        gossip_window=2,
+        gossip_history=5,
+        heartbeat_initial_delay=2.0,
+        heartbeat_interval=5,
+    )
 
-    async with host.run(listen_addrs=listen_addr), trio.open_nursery() as nursery:
+    pubsub = Pubsub(host, gossipsub)
+    stop_event = trio.Event()
+    worker_id = host.get_id().to_string()[:8]
+
+    async with host.run(listen_addrs=listen_addrs), trio.open_nursery() as nursery:
         nursery.start_soon(host.get_peerstore().start_cleanup_task, 60)
-        print(f"I am {host.get_id().to_string()}")
+        logger.info(f"Node started | Peer ID: {host.get_id()}")
 
-        if not destination:
-            rr.set_handler(PROTOCOL_ID, handler=handler, codec=codec)
-            peer_id = host.get_id().to_string()
-            print("Listener ready, listening on:\n")
-            for addr in listen_addr:
-                print(f"{addr}/p2p/{peer_id}")
+        async with background_trio_service(pubsub):
+            async with background_trio_service(gossipsub):
+                await pubsub.wait_until_ready()
 
-            optimal_addr = get_optimal_binding_address(port)
-            optimal_addr_with_peer = f"{optimal_addr}/p2p/{peer_id}"
-            print(
-                "\nRun this from the same folder in another console:\n\n"
-                f"request-response-demo -d {optimal_addr_with_peer} --message hello\n"
-            )
-            print("Waiting for incoming requests...")
-            await trio.sleep_forever()
+                task_sub = await pubsub.subscribe(TASK_TOPIC)
+                response_sub = await pubsub.subscribe(RESPONSE_TOPIC)
 
-        destination_str = destination
-        if destination_str is None:
-            raise ValueError("destination is required in dialer mode")
-        maddr = multiaddr.Multiaddr(destination_str)
-        info = info_from_p2p_addr(maddr)
-        await host.connect(info)
-        response = await rr.send_request(
-            peer_id=info.peer_id,
-            protocol_ids=[PROTOCOL_ID],
-            request={"message": message},
-            codec=codec,
-        )
-        print(f"Sent: {message}")
-        print(f"Received: {response}")
+                if not destination:
+                    optimal = get_optimal_binding_address(port)
+                    peer_addr = f"{optimal}/p2p/{host.get_id().to_string()}"
+
+                    logger.info("\nShare this address with worker agents:")
+                    logger.info(f"\n  python agent.py -d {peer_addr} --worker\n")
+                    logger.info("Waiting for workers...")
+                    await trio.sleep(1)
+
+                    nursery.start_soon(dispatcher_response_loop, response_sub, stop_event)
+                    nursery.start_soon(dispatcher_input_loop, pubsub, stop_event)
+
+                else:
+                    maddr = multiaddr.Multiaddr(destination)
+                    info = info_from_p2p_addr(maddr)
+
+                    logger.info(f"Connecting to dispatcher: {info.peer_id}")
+                    await host.connect(info)
+                    logger.info("Connected. Waiting for mesh to form...")
+                    await trio.sleep(2)
+
+                    nursery.start_soon(worker_loop, task_sub, pubsub, worker_id, stop_event)
+
+                await stop_event.wait()
+
+        nursery.cancel_scope.cancel()
+
+    logger.info("Shutdown complete")
 
 
-def main() -> None:
-    description = """
-    Demonstrates the request/response helper with a single JSON request and response.
-    Run once without -d to start a listener, then run again with -d to send a request.
-    """
-    example_maddr = (
-        "/ip4/[HOST_IP]/tcp/8000/p2p/QmQn4SwGkDZKkUEpBRBvTmheQycxAHJUNmVEnjA2v1qe8Q"
+def main():
+    parser = argparse.ArgumentParser(
+        description="AI agent communication demo over py-libp2p GossipSub."
     )
-    parser = argparse.ArgumentParser(description=description)
-    parser.add_argument("-p", "--port", default=0, type=int, help="source port")
-    parser.add_argument(
-        "-d",
-        "--destination",
-        type=str,
-        help=f"destination multiaddr string, e.g. {example_maddr}",
-    )
-    parser.add_argument(
-        "--message",
-        type=str,
-        default="hello",
-        help="JSON message payload to send",
-    )
-    parser.add_argument(
-        "-s",
-        "--seed",
-        type=int,
-        help="seed the RNG to make peer IDs reproducible",
-    )
+    parser.add_argument("-d", "--destination", type=str, default=None)
+    parser.add_argument("--worker", action="store_true")
+    parser.add_argument("-p", "--port", type=int, default=None)
+    parser.add_argument("-v", "--verbose", action="store_true")
+
     args = parser.parse_args()
+
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+
+    role = "Worker" if args.destination else "Dispatcher"
+    logger.info(f"Starting | Role: {role}")
+
     try:
-        trio.run(run, args.port, args.destination, args.message, args.seed)
+        trio.run(run, args.destination, args.worker, args.port)
     except KeyboardInterrupt:
-        pass
+        logger.info("Terminated by user")
 
 
 if __name__ == "__main__":
