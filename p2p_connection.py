@@ -2,14 +2,11 @@ import argparse
 import json
 import logging
 import time
-import os
-from litellm import completion
-from dotenv import load_dotenv
-load_dotenv()
 
 import multiaddr
 import trio
 
+from agent import process_task
 from libp2p import new_host
 from libp2p.crypto.rsa import create_new_key_pair
 from libp2p.custom_types import TProtocol
@@ -31,31 +28,6 @@ RESPONSE_TOPIC = "agent/responses/v1"
 GOSSIPSUB_PROTOCOL_ID = TProtocol("/meshsub/1.0.0")
 
 key_pair = create_new_key_pair()
-
-
-def process_task(task: str, worker_id: str) -> str | None:
-    task_lower = task.lower()
-
-    response = completion(
-        model="openai/aisingapore/Gemma-SEA-LION-v4-27B-IT",
-
-        api_key=os.getenv("SEALION_API_KEY"),
-
-        api_base="https://api.sea-lion.ai/v1",
-
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a helpful AI assistant."
-            },
-            {
-                "role": "user",
-                "content": task
-            }
-        ]
-    )
-
-    return response.choices[0].message.content # type: ignore
 
 
 async def worker_loop(task_sub, pubsub, worker_id, stop_event):
