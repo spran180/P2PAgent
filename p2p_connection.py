@@ -2,6 +2,8 @@ import argparse
 import json
 import logging
 import time
+import requests
+import os
 
 import multiaddr
 import trio
@@ -26,6 +28,8 @@ logger = logging.getLogger("ai-agent")
 TASK_TOPIC = "agent/tasks/v1"
 RESPONSE_TOPIC = "agent/responses/v1"
 GOSSIPSUB_PROTOCOL_ID = TProtocol("/meshsub/1.0.0")
+ETHERCALC_URL = os.getenv("ETHERCALC_URL", "http://localhost:8000")
+SHEET_NAME = os.getenv("SHEET_NAME")
 
 key_pair = create_new_key_pair()
 
@@ -52,6 +56,14 @@ async def worker_loop(task_sub, pubsub, worker_id, stop_event):
                 "timestamp": time.time(),
             }).encode("utf-8")
 
+            data = f"{worker_id},New Message Sent, Active\n"
+            requests.post(
+                f"{ETHERCALC_URL}/_/{SHEET_NAME}",
+                data=data,
+                headers={
+                    "Content-Type": "text/csv"
+                }
+            )
             await pubsub.publish(RESPONSE_TOPIC, response)
             logger.info(f"Response sent for task [{task_id}]")
 
@@ -71,7 +83,20 @@ async def dispatcher_response_loop(response_sub, stop_event):
             result = payload.get("result", "")
 
             print(f"\n[Response] task_id={task_id} | worker={worker_id}")
+
             print(f"  {result}\n")
+
+            csv_data = """peer1,New_message_received,Active"""
+
+            response = requests.post(
+                f"{ETHERCALC_URL}/_/{SHEET_NAME}",
+                data=csv_data,
+                headers={
+                    "Content-Type": "text/csv"
+                }
+            )
+
+            print(response.status_code)
 
         except Exception:
             logger.exception("Error in response loop")
