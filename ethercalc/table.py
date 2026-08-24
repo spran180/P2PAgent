@@ -31,3 +31,7 @@ def get_table_data():
     except requests.RequestException as e:
         print(f"Error retrieving table '{SHEET_NAME}' data: {e}")
 
+
+if __name__ == "__main__":
+    get_table_data()
+
